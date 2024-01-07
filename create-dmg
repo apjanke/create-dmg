@@ -1,71 +1,128 @@
 #!/usr/bin/env bash
+#
+# create-dmg [...options...] <outfile.dmg> <source_folder>
+#
+# Create a read-only DMG format disk image of the contents of a folder.
 
-# Create a read-only disk image of the contents of a folder
+# Notes:
+#
+# In this code, "CDMG" is an abbreviation for "create-dmg", that is, this program.
 
-# Bail out on any unhandled errors
-set -e;
-# Any command that exits with non-zero code will cause the pipeline to fail
-set -o pipefail;
+# Use conservative bash error handling for correctness
+set -o errexit
+set -o nounset
+set -o pipefail
+if [[ "${TRACE-0}" == 1 ]]; then set -o xtrace; fi
 
-CDMG_VERSION='1.2.1'
+# Utility functions
+
+function info() {
+  echo "$*"
+}
+
+function info2() {
+  echo >&2 "$*"
+}
+
+function debug_section_header() {
+	# A debug section header with lots of white space, to make it easier to skim through
+	# the verbose debug-level output.
+	local label="$1"
+	if [[ $DEBUG == 1 ]]; then
+	  echo ""
+		echo ""
+		echo "==========  ${label}  =========="
+		echo ""
+		echo ""
+	fi
+}
+
+function error() {
+  echo >&2 "${THIS_PROGRAM}: ERROR: $*"
+}
+
+function die() {
+	local msg="$1"
+  error "$msg"
+  exit 1
+}
+
+function verbose() {
+  if [[ $VERBOSE == 1 ]]; then
+    echo "$*"
+  fi
+}
+
+function is_dry_run() {
+  if [[ $DRY_RUN == 1 ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+function wet() {
+  if is_dry_run; then
+    echo "dry run: would run: $*"
+  else
+    verbose "running: $*"
+    "$@"
+  fi
+}
+
+# Main code
+
+THIS_PROGRAM='create-dmg'
+CDMG_VERSION='1.2.2.alpha1'
 
 # The full path to the "support/" directory this script is using
 # (This will be set up by code later in the script.)
-CDMG_SUPPORT_DIR=""
+CDMG_SUPPORT_DIR=''
 
-OS_FULL_VERSION="$(sw_vers | sed -n 2p | cut -d : -f 2 | tr -d '[:space:]' | cut -c1-)"
-OS_MAJOR_VERSION="$(echo $OS_FULL_VERSION | cut -d . -f 1)"
-OS_MINOR_VERSION="$(echo $OS_FULL_VERSION | cut -d . -f 2)"
+OS_FULL_VERSION=$(sw_vers | sed -n 2p | cut -d : -f 2 | tr -d '[:space:]' | cut -c1-)
+OS_MAJOR_VERSION=$(echo $OS_FULL_VERSION | cut -d . -f 1)
+OS_MINOR_VERSION=$(echo $OS_FULL_VERSION | cut -d . -f 2)
+MACHINE_ARCH=$(uname -m)
+
 WINX=10
 WINY=60
 WINW=500
 WINH=350
 ICON_SIZE=128
 TEXT_SIZE=16
-FORMAT="UDZO"
-FILESYSTEM="HFS+"
+FORMAT='UDZO'
+FILESYSTEM='HFS+'
 ADD_FILE_SOURCES=()
 ADD_FILE_TARGETS=()
-IMAGEKEY=""
-HDIUTIL_VERBOSITY=""
+IMAGEKEY=''
+HDIUTIL_VERB_ARGS=''
 SANDBOX_SAFE=0
-BLESS=0
+DO_BLESS=0
+NOINTERNET=0
 SKIP_JENKINS=0
-MAXIMUM_UNMOUNTING_ATTEMPTS=3
-SIGNATURE=""
-NOTARIZE=""
+MAX_UNMOUNTING_ATTEMPTS=3
+SIGNATURE=''
+NOTARIZE=''
+QL_LINK=''
+ENABLE_ENCRYPTION=0
+# Default to verbose while debugging.
+# TODO: Remove when done debugging
+VERBOSE=1
+# VERBOSE=0
+DRY_RUN=0
+DEBUG=0
 
 function pure_version() {
-	echo "$CDMG_VERSION"
-}
-
-function hdiutil_detach_retry() {
-	# Unmount
-	unmounting_attempts=0
-	until
-		echo "Unmounting disk image..."
-		(( unmounting_attempts++ ))
-		hdiutil detach "$1"
-		exit_code=$?
-		(( exit_code ==  0 )) && break            # nothing goes wrong
-		(( exit_code != 16 )) && exit $exit_code  # exit with the original exit code
-		# The above statement returns 1 if test failed (exit_code == 16).
-		#   It can make the code in the {do... done} block to be executed
-	do
-		(( unmounting_attempts == MAXIMUM_UNMOUNTING_ATTEMPTS )) && exit 16  # patience exhausted, exit with code EBUSY
-		echo "Wait a moment..."
-		sleep $(( 1 * (2 ** unmounting_attempts) ))
-	done
-	unset unmounting_attempts
+  echo "$CDMG_VERSION"
 }
 
 function version() {
-	echo "create-dmg $(pure_version)"
+  echo "create-dmg $(pure_version)"
 }
 
 function usage() {
-	version
-	cat <<EOHELP
+  version
+  cat <<EOHELP
 
 Creates a fancy DMG file.
 
@@ -88,14 +145,14 @@ Options:
       set window text size (10-16)
   --icon-size <icon_size>
       set window icons size (up to 128)
-  --icon file_name <x> <y>
-      set position of the file's icon
+  --icon <file_name> <x> <y>
+      set position of a file's icon
   --hide-extension <file_name>
-      hide the extension of file
+      hide the extension of a file
   --app-drop-link <x> <y>
-      make a drop link to Applications, at location x,y
+      make a drop link to Applications, at location (x, y)
   --ql-drop-link <x> <y>
-      make a drop link to user QuickLook install dir, at location x,y
+      make a drop link to user QuickLook install dir, at location (x, y)
   --eula <eula_file>
       attach a license file to the dmg (plain text or RTF)
   --no-internet-enable
@@ -103,15 +160,15 @@ Options:
   --format <format>
       specify the final disk image format (UDZO|UDBZ|ULFO|ULMO) (default is UDZO)
   --filesystem <filesystem>
-      specify the disk image filesystem (HFS+|APFS) (default is HFS+, APFS supports macOS 10.13 or newer)
+      specify the disk image filesystem (HFS+|APFS) (default is HFS+, APFS supported on >= macOS 10.13)
   --encrypt
       enable encryption for the resulting disk image (AES-256 - you will be prompted for password)
   --encrypt-aes128
       enable encryption for the resulting disk image (AES-128 - you will be prompted for password)
-  --add-file <target_name> <file>|<folder> <x> <y>
+  --add-file <target_name> (<file>|<folder>) <x> <y>
       add additional file or folder (can be used multiple times)
   --disk-image-size <x>
-      set the disk image size manually to x MB
+      set the disk image size explicitly to x MB
   --hdiutil-verbose
       execute hdiutil in verbose mode
   --hdiutil-quiet
@@ -124,490 +181,576 @@ Options:
       notarize the disk image (waits and staples) with the keychain stored credentials
   --sandbox-safe
       execute hdiutil with sandbox compatibility and do not bless (not supported for APFS disk images)
+  --skip-jenkins
+      skip Finder-prettifying AppleScript; useful in Sandbox and non-GUI environments
+	--verbose
+	    do verbose output; does not imply --hdiutil-verbose
   --version
-	    show create-dmg version number
-  -h, --help
-	    display this help screen
+      show create-dmg version number
+  --help, -h
+      display the help screen
 
 EOHELP
-	exit 0
 }
 
-# factors can cause interstitial disk images to contain more than a single
+# Find where the DMG is mounted on the filesystem.
+#
+# Factors can cause interstitial disk images to contain more than a single
 # partition - expand the hunt for the temporary disk image by checking for
-# the path of the volume, versus assuming its the first result (as in pr/152).
+# the path of the volume, versus assuming it's the first result (as in pr/152).
 function find_mount_dir() {
-	local dev_name="${1}"
+  local dev_name="${1}"
+	local found_dir
 
-	>&2 echo "Searching for mounted interstitial disk image using ${dev_name}... "
-	# enumerate up to 9 partitions
-	for i in {1..9}; do
-		# attempt to find the partition
-		local found_dir
-		found_dir=$(hdiutil info | grep -E --color=never "${dev_name}" | head -${i} | awk '{print $3}')
-		if [[ -n "${found_dir}" ]]; then
-				echo "${found_dir}"
-				return 0
-		fi
-	done
+  info2 "Searching for mounted interstitial disk image for device ${dev_name}... "
+  # enumerate up to 9 partitions
+  for i in {1..9}; do
+		# The "s" suffix is to select /dev/diskMsN volumes instead of the main /dev/diskM
+		# block device.
+    found_dir=$(hdiutil info | grep -E --color=never "${dev_name}s" | head -${i} | tail -1 | awk '{print $3}')
+    if [[ -n "${found_dir}" ]]; then
+		  info2 "find_mount_dir: found ${dev_name} at: ${found_dir}"
+			echo "${found_dir}"
+			return 0
+    fi
+  done
+}
+
+function hdiutil_detach_retry() {
+  # Unmount
+  local unmounting_attempts=0 exit_code
+  until
+    info "Unmounting disk image..."
+    (( unmounting_attempts++ ))
+    wet hdiutil detach "$1"
+    exit_code=$?
+    (( exit_code ==  0 )) && break            # nothing goes wrong
+    (( exit_code != 16 )) && exit $exit_code  # exit with the original exit code
+    # The above statement returns 1 if test failed (exit_code == 16).
+    #   It can make the code in the {do... done} block to be executed
+  do
+    (( unmounting_attempts == MAX_UNMOUNTING_ATTEMPTS )) && exit 16  # patience exhausted, exit with code EBUSY
+    info "Wait a moment..."
+    sleep $(( 1 * (2 ** unmounting_attempts) ))
+  done
 }
 
 # Argument parsing
 
+POSITION_CLAUSE=''
+HIDING_CLAUSE=''
+QL_CLAUSE=''
+
 while [[ "${1:0:1}" = "-" ]]; do
-	case $1 in
-		--volname)
-			VOLUME_NAME="$2"
-			shift; shift;;
-		--volicon)
-			VOLUME_ICON_FILE="$2"
-			shift; shift;;
-		--background)
-			BACKGROUND_FILE="$2"
-			BACKGROUND_FILE_NAME="$(basename "$BACKGROUND_FILE")"
-			BACKGROUND_CLAUSE="set background picture of opts to file \".background:$BACKGROUND_FILE_NAME\""
-			REPOSITION_HIDDEN_FILES_CLAUSE="set position of every item to {theBottomRightX + 100, 100}"
-			shift; shift;;
-		--icon-size)
-			ICON_SIZE="$2"
-			shift; shift;;
-		--text-size)
-			TEXT_SIZE="$2"
-			shift; shift;;
-		--window-pos)
-			WINX=$2; WINY=$3
-			shift; shift; shift;;
-		--window-size)
-			WINW=$2; WINH=$3
-			shift; shift; shift;;
-		--icon)
-			POSITION_CLAUSE="${POSITION_CLAUSE}set position of item \"$2\" to {$3, $4}
-			"
-			shift; shift; shift; shift;;
-		--hide-extension)
-			HIDING_CLAUSE="${HIDING_CLAUSE}set the extension hidden of item \"$2\" to true
-			"
-			shift; shift;;
-		-h | --help)
-			usage;;
-		--version)
-			version; exit 0;;
-		--pure-version)
-			pure_version; exit 0;;
-		--ql-drop-link)
-			QL_LINK=$2
-			QL_CLAUSE="set position of item \"QuickLook\" to {$2, $3}
-			"
-			shift; shift; shift;;
-		--app-drop-link)
-			APPLICATION_LINK=$2
-			APPLICATION_CLAUSE="set position of item \"Applications\" to {$2, $3}
-			"
-			shift; shift; shift;;
-		--eula)
-			EULA_RSRC=$2
-			shift; shift;;
-		--no-internet-enable)
-			NOINTERNET=1
-			shift;;
-		--format)
-			FORMAT="$2"
-			shift; shift;;
-		--filesystem)
-			FILESYSTEM="$2"
-			shift; shift;;
-		--encrypt)
-			ENABLE_ENCRYPTION=1
-			AESBITS=256
-			shift;;
-		--encrypt-aes128)
-			ENABLE_ENCRYPTION=1
-			AESBITS=128
-			shift;;
-		--add-file | --add-folder)
-			ADD_FILE_TARGETS+=("$2")
-			ADD_FILE_SOURCES+=("$3")
-			POSITION_CLAUSE="${POSITION_CLAUSE}
-			set position of item \"$2\" to {$4, $5}
-			"
-			shift; shift; shift; shift; shift;;
-		--disk-image-size)
-			DISK_IMAGE_SIZE="$2"
-			shift; shift;;
-		--hdiutil-verbose)
-			HDIUTIL_VERBOSITY='-verbose'
-			shift;;
-		--hdiutil-quiet)
-			HDIUTIL_VERBOSITY='-quiet'
-			shift;;
-		--codesign)
-			SIGNATURE="$2"
-			shift; shift;;
-		--notarize)
-			NOTARIZE="$2"
-			shift; shift;;
-		--sandbox-safe)
-			SANDBOX_SAFE=1
-			shift;;
-		--bless)
-			BLESS=1
-			shift;;
-		--rez)
-			echo "REZ is no more directly used. You can remove the --rez argument."
-			shift; shift;;
-		--skip-jenkins)
-			SKIP_JENKINS=1
-			shift;;
-		-*)
-			echo "Unknown option: $1. Run 'create-dmg --help' for help."
-			exit 1;;
-	esac
-	case $FORMAT in
-		UDZO)
-			IMAGEKEY="-imagekey zlib-level=9";;
-		UDBZ)
-			IMAGEKEY="-imagekey bzip2-level=9";;
-		ULFO)
-			;;
-		ULMO)
-			;;
-		*)
-			echo >&2 "Unknown disk image format: $FORMAT"
-			exit 1;;
-	esac
+  arg="$1"; shift
+  case "$arg" in
+    --volname)
+      VOLUME_NAME="$1"; shift ;;
+    --volicon)
+      VOLUME_ICON_FILE="$1"; shift ;;
+    --background)
+      BACKGROUND_FILE="$1"
+      BACKGROUND_FILE_NAME="$(basename "$BACKGROUND_FILE")"
+      BACKGROUND_CLAUSE="set background picture of opts to file \".background:$BACKGROUND_FILE_NAME\""
+      REPOSITION_HIDDEN_FILES_CLAUSE="set position of every item to {theBottomRightX + 100, 100}"
+      shift ;;
+    --window-pos)
+      WINX="$1"; WINY="$2"
+      shift 2;;
+    --window-size)
+      WINW="$1"; WINH="$2"
+      shift 2;;
+    --text-size)
+      TEXT_SIZE="$1"; shift ;;
+    --icon-size)
+      ICON_SIZE="$1"; shift ;;
+    --icon)
+      POSITION_CLAUSE="${POSITION_CLAUSE}set position of item \"$1\" to {$2, $3}
+      "
+      shift 3;;
+    --hide-extension)
+      HIDING_CLAUSE="${HIDING_CLAUSE}set the extension hidden of item \"$1\" to true
+      "
+      shift ;;
+    --app-drop-link)
+      APPLICATION_LINK="$1"
+      APPLICATION_CLAUSE="set position of item \"Applications\" to {$1, $2}
+      "
+      shift 2 ;;
+    --ql-drop-link)
+      QL_LINK="$1"
+      QL_CLAUSE="set position of item \"QuickLook\" to {$1, $2}
+      "
+      shift 2 ;;
+    --eula)
+      EULA_RSRC="$1"; shift ;;
+    --no-internet-enable)
+      NOINTERNET=1; shift ;;
+    --format)
+      FORMAT="$1"; shift ;;
+    --filesystem)
+      FILESYSTEM="$1"; shift ;;
+    --encrypt)
+      ENABLE_ENCRYPTION=1
+      AESBITS=256 ;;
+    --encrypt-aes128 )
+      ENABLE_ENCRYPTION=1
+      AESBITS=128 ;;
+    --add-file|--add-folder)
+      ADD_FILE_TARGETS+=("$1")
+      ADD_FILE_SOURCES+=("$2")
+      POSITION_CLAUSE="${POSITION_CLAUSE}
+      set position of item \"$1\" to {$3, $4}
+      "
+      shift 4 ;;
+    --disk-image-size)
+      DISK_IMAGE_SIZE="$1"; shift ;;
+    --hdiutil-verbose)
+      HDIUTIL_VERB_ARGS='-verbose' ;;
+		--verbose)
+		  VERBOSE=1 ;;
+    --hdiutil-quiet)
+      HDIUTIL_VERB_ARGS='-quiet' ;;
+    --bless)
+      BLESS=1 ;;
+    --codesign)
+      SIGNATURE="$1"; shift ;;
+    --notarize)
+      NOTARIZE="$1"; shift ;;
+    --sandbox-safe)
+      SANDBOX_SAFE=1 ;;
+    --skip-jenkins)
+      SKIP_JENKINS=1 ;;
+    --version)
+      version; exit 0 ;;
+    --pure-version)
+      pure_version; exit 0 ;;
+		--debug)
+		  DEBUG=1 ;;
+    --help | -h)
+      usage; exit 0 ;;
+    # Deprecated and back-compatibility options (not included in doco)
+    --rez)
+      echo "REZ is no longer directly used. Ignoring the --rez argument. You can remove it."
+      shift ;;
+    -*)
+      die "Unknown option: ${arg}. Run 'create-dmg --help' for help." ;;
+  esac
+  case $FORMAT in
+    UDZO)
+      IMAGEKEY="-imagekey zlib-level=9";;
+    UDBZ)
+      IMAGEKEY="-imagekey bzip2-level=9";;
+    ULFO)
+      ;;
+    ULMO)
+      ;;
+    *)
+      die "Unknown disk image format: $FORMAT" ;;
+  esac
 done
 
-if [[ -z "$2" ]]; then
-	echo "Not enough arguments. Run 'create-dmg --help' for help."
-	exit 1
+if [[ $# < 2 ]]; then
+  die "Not enough arguments. Run 'create-dmg --help' for help."
+fi
+if [[ $# > 2 ]]; then
+  die "Too many arguments. Run 'create-dmg --help' for help."
 fi
 
 DMG_PATH="$1"
-SRC_FOLDER="$(cd "$2" > /dev/null; pwd)"
+SRC_FOLDER=$(cd "$2" > /dev/null; pwd)
 
-# Argument validation checks
+# Argument validation
 
+if [[ ! -e "$SRC_FOLDER" ]]; then
+  die "Source folder does not exist or is not a folder: ${SRC_FOLDER}"
+fi
 if [[ "${DMG_PATH: -4}" != ".dmg" ]]; then
-	echo "Output file name must end with a .dmg extension. Run 'create-dmg --help' for help."
-	exit 1
+  die "Output file name must end with a .dmg extension. Run 'create-dmg --help' for help."
 fi
-
 if [[ "${FILESYSTEM}" != "HFS+" ]] && [[ "${FILESYSTEM}" != "APFS" ]]; then
-	echo "Unknown disk image filesystem: ${FILESYSTEM}. Run 'create-dmg --help' for help."
-	exit 1
+  die "Unknown disk image filesystem: ${FILESYSTEM}. Run 'create-dmg --help' for help."
 fi
-
-if [[ "${FILESYSTEM}" == "APFS" ]] && [[ ${SANDBOX_SAFE} -eq 1 ]]; then
-	echo "Creating an APFS disk image that is sandbox safe is not supported."
-	exit 1
+if [[ "${FILESYSTEM}" == "APFS" ]] && [[ ${SANDBOX_SAFE} == 1 ]]; then
+  die "Creating an APFS disk image that is sandbox safe is not supported."
 fi
 
 # Main script logic
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-DMG_DIRNAME="$(dirname "$DMG_PATH")"
-DMG_DIR="$(cd "$DMG_DIRNAME" > /dev/null; pwd)"
-DMG_NAME="$(basename "$DMG_PATH")"
-DMG_TEMP_NAME="$DMG_DIR/rw.$$.${DMG_NAME}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DMG_NAME=$(basename "$DMG_PATH")
+DMG_DIRNAME=$(dirname "$DMG_PATH")
+if [[ -z "$DMG_DIRNAME" ]]; then
+  DMG_DIR=$(pwd)
+else
+  DMG_DIR=$(cd "$DMG_DIRNAME" > /dev/null; pwd)
+fi
+DMG_TEMP_NAME="${DMG_DIR}/cdmg_temp.rw.$$.${DMG_NAME}"
 
 # Detect where we're running from
 
-sentinel_file="$SCRIPT_DIR/.this-is-the-create-dmg-repo"
-if [[ -f "$sentinel_file" ]]; then
-	# We're running from inside a repo
-	CDMG_SUPPORT_DIR="$SCRIPT_DIR/support"
-else
-	# We're running inside an installed location
-	bin_dir="$SCRIPT_DIR"
-	prefix_dir=$(dirname "$bin_dir")
-	CDMG_SUPPORT_DIR="$prefix_dir/share/create-dmg/support"
+function detect_script_location() {
+  local sentinel_file prefix_dir
+  sentinel_file="$SCRIPT_DIR/.this-is-the-create-dmg-repo"
+  if [[ -f "$sentinel_file" ]]; then
+    # We're running from inside the repo
+    CDMG_SUPPORT_DIR="$SCRIPT_DIR/support"
+  else
+    # We're running from an installation; assume standard dir layout, with
+		# this script in <prefix>/bin.
+    prefix_dir=$(dirname $(dirname $(realpath "$0")))
+		if [[ ! -d "$prefix_dir" ]]; then
+		  die "Failed detecting my installation prefix: not a directory: ${prefix_dir}"
+		fi
+    CDMG_SUPPORT_DIR="$prefix_dir/share/create-dmg/support"
+  fi
+}
+detect_script_location
+
+if [[ ! -d "$CDMG_SUPPORT_DIR" ]]; then
+  die "Cannot find support/ directory: expected at: $CDMG_SUPPORT_DIR"
 fi
 
 if [[ -z "$VOLUME_NAME" ]]; then
-	VOLUME_NAME="$(basename "$DMG_PATH" .dmg)"
-fi
-
-if [[ ! -d "$CDMG_SUPPORT_DIR" ]]; then
-	echo >&2 "Cannot find support/ directory: expected at: $CDMG_SUPPORT_DIR"
-	exit 1
+  VOLUME_NAME="$(basename "$DMG_PATH" .dmg)"
 fi
 
 if [[ -f "$SRC_FOLDER/.DS_Store" ]]; then
-	echo "Deleting .DS_Store found in source folder"
-	rm "$SRC_FOLDER/.DS_Store"
+  echo "Deleting .DS_Store file found in source folder"
+  wet rm "$SRC_FOLDER/.DS_Store"
 fi
 
 # Create the image
 echo "Creating disk image..."
 if [[ -f "${DMG_TEMP_NAME}" ]]; then
-	rm -f "${DMG_TEMP_NAME}"
+  echo "Removing old temporary DMG at ${DMG_TEMP_NAME}"
+  wet rm -f "${DMG_TEMP_NAME}"
 fi
 
 # Use Megabytes since hdiutil fails with very large byte numbers
 function blocks_to_megabytes() {
-	# Add 1 extra MB, since there's no decimal retention here
-	MB_SIZE=$((($1 * 512 / 1000 / 1000) + 1))
-	echo $MB_SIZE
+  local size_blocks size_bytes blocks_per_mb size_mb
+  size_blocks="$1"
+  # HFS+ uses 4KB blocks, at least by default
+  blocks_per_mb=256
+  size_bytes=$(($size_blocks * $blocks_per_mb))
+  # Add 1 extra MB, since there's no decimal retention here
+  size_mb=$((($size_bytes / 1048576) + 1))
+  echo $size_mb
 }
 
-function get_size() {
-	# Get block size in disk
-	if [[ $OS_MAJOR_VERSION -ge 12 ]]; then
-		bytes_size=$(du -B 512 -s "$1")
+function get_size_mb() {
+  # Get size of file or dir in megabytes
+  local file du_out size_bytes fake_size_mb
+  file="$1"
+	if is_dry_run; then
+	  fake_size_bytes=123456789
+	  info2 "dry run: using fake DMG size of ${fake_size_bytes} MB"
+		echo "$fake_size_mb"
+		size_bytes="$fake_size_bytes"
 	else
-		bytes_size=$(du -s "$1")
+		# TODO: document why the different option for macOS 12+
+		if [[ $OS_MAJOR_VERSION -ge 12 ]]; then
+			du_out=$(du -B 512 -s "$file")
+		else
+			du_out=$(du -s "$file")
+		fi
+		size_bytes=$(echo "$du_out" | cut -f 1)
 	fi
-	bytes_size=$(echo $bytes_size | sed -e 's/	.*//g')
-	echo $(blocks_to_megabytes $bytes_size)
+	if [[ -z "$size_bytes" ]]; then
+	  die "Failed detecting file size for: ${file}"
+	fi
+  echo $(blocks_to_megabytes "$size_bytes")
 }
 
 # Create the DMG with the specified size or the hdiutil estimation
-CUSTOM_SIZE=''
+CUSTOM_SIZE_ARGS=''
 if [[ -n "$DISK_IMAGE_SIZE" ]]; then
-	CUSTOM_SIZE="-size ${DISK_IMAGE_SIZE}m"
+  CUSTOM_SIZE_ARGS="-size ${DISK_IMAGE_SIZE}m"
 fi
 
-if [[ $SANDBOX_SAFE -eq 0 ]]; then
-	if [[ "$FILESYSTEM" == "APFS" ]]; then
-		FILESYSTEM_ARGUMENTS=""
-	else
-		FILESYSTEM_ARGUMENTS="-c c=64,a=16,e=16"
-	fi
-	hdiutil create ${HDIUTIL_VERBOSITY} -srcfolder "$SRC_FOLDER" -volname "${VOLUME_NAME}" \
-		-fs "${FILESYSTEM}" -fsargs "${FILESYSTEM_ARGUMENTS}" -format UDRW ${CUSTOM_SIZE} "${DMG_TEMP_NAME}"
+info "Creating interstitial DMG at: ${DMG_TEMP_NAME}"
+if [[ $SANDBOX_SAFE == 0 ]]; then
+  if [[ $FILESYSTEM == "APFS" ]]; then
+    FILESYSTEM_ARGS=""
+  else
+    FILESYSTEM_ARGS="-c c=64,a=16,e=16"
+  fi
+  wet hdiutil create ${HDIUTIL_VERB_ARGS} -srcfolder "$SRC_FOLDER" -volname "$VOLUME_NAME" \
+    -fs "${FILESYSTEM}" -fsargs "${FILESYSTEM_ARGS}" -format UDRW ${CUSTOM_SIZE_ARGS} \
+    "$DMG_TEMP_NAME"
 else
-	hdiutil makehybrid ${HDIUTIL_VERBOSITY} -default-volume-name "${VOLUME_NAME}" -hfs -o "${DMG_TEMP_NAME}" "$SRC_FOLDER"
-	hdiutil convert -format UDRW -ov -o "${DMG_TEMP_NAME}" "${DMG_TEMP_NAME}"
-	DISK_IMAGE_SIZE_CUSTOM=$DISK_IMAGE_SIZE
+  # sandbox-safe variant
+  wet hdiutil makehybrid ${HDIUTIL_VERB_ARGS} -default-volume-name "$VOLUME_NAME" -hfs \
+    -o "$DMG_TEMP_NAME" "$SRC_FOLDER"
+  wet hdiutil convert -format UDRW -ov -o "$DMG_TEMP_NAME" "$DMG_TEMP_NAME"
+  DISK_IMAGE_SIZE_CUSTOM="$DISK_IMAGE_SIZE"
 fi
 
 # Get the created DMG actual size
-DISK_IMAGE_SIZE=$(get_size "${DMG_TEMP_NAME}")
+# TODO: This seems like a bug, because it's the size of the .dmg file on disk, not
+# the size of the virtual filesystem inside the DMG? They should be close, but not
+# exactly the same.
+DISK_IMAGE_SIZE=$(get_size_mb "${DMG_TEMP_NAME}")
 
 # Use the custom size if bigger
-if [[ $SANDBOX_SAFE -eq 1 ]] && [[ ! -z "$DISK_IMAGE_SIZE_CUSTOM" ]] && [[ $DISK_IMAGE_SIZE_CUSTOM -gt $DISK_IMAGE_SIZE ]]; then
-	DISK_IMAGE_SIZE=$DISK_IMAGE_SIZE_CUSTOM
+if [[ $SANDBOX_SAFE -eq 1 ]] && [[ ! -z "$DISK_IMAGE_SIZE_CUSTOM" ]] \
+    && [[ $DISK_IMAGE_SIZE_CUSTOM -gt $DISK_IMAGE_SIZE ]]; then
+  DISK_IMAGE_SIZE="$DISK_IMAGE_SIZE_CUSTOM"
 fi
 
 # Estimate the additional sources size
 if [[ -n "$ADD_FILE_SOURCES" ]]; then
-	for i in "${!ADD_FILE_SOURCES[@]}"; do
-		SOURCE_SIZE=$(get_size "${ADD_FILE_SOURCES[$i]}")
-		DISK_IMAGE_SIZE=$(expr $DISK_IMAGE_SIZE + $SOURCE_SIZE)
-	done
+  for i in "${!ADD_FILE_SOURCES[@]}"; do
+    source_size=$(get_size_mb "${ADD_FILE_SOURCES[$i]}")
+    DISK_IMAGE_SIZE=$(($DISK_IMAGE_SIZE + $source_size))
+  done
 fi
 
 # Add extra space for additional resources
-DISK_IMAGE_SIZE=$(expr $DISK_IMAGE_SIZE + 20)
+DISK_IMAGE_SIZE=$(($DISK_IMAGE_SIZE + 20))
 
 # Make sure target image size is within limits
-MIN_DISK_IMAGE_SIZE=$(hdiutil resize -limits "${DMG_TEMP_NAME}" | awk 'NR=1{print int($1/2048+1)}')
-if [ $MIN_DISK_IMAGE_SIZE -gt $DISK_IMAGE_SIZE ]; then
-       DISK_IMAGE_SIZE=$MIN_DISK_IMAGE_SIZE
+min_disk_image_size=$(hdiutil resize -limits "${DMG_TEMP_NAME}" | awk 'NR=1{print int($1/2048+1)}')
+if [[ $min_disk_image_size > $DISK_IMAGE_SIZE ]]; then
+  DISK_IMAGE_SIZE=$min_disk_image_size
 fi
 
 # Resize the image for the extra stuff
-hdiutil resize ${HDIUTIL_VERBOSITY} -size ${DISK_IMAGE_SIZE}m "${DMG_TEMP_NAME}"
+wet hdiutil resize ${HDIUTIL_VERB_ARGS} -size "${DISK_IMAGE_SIZE}m" "${DMG_TEMP_NAME}"
 
 # Mount the new DMG
 
-echo "Mounting disk image..."
+info "Mounting disk image..."
+
+if is_dry_run; then
+  echo "dry run: This is as far as a dry run can proceed. Exiting."
+	exit 0
+fi
 
 MOUNT_RANDOM_PATH="/Volumes"
 if [[ $SANDBOX_SAFE -eq 1 ]]; then
-	MOUNT_RANDOM_PATH="/tmp"
+  MOUNT_RANDOM_PATH="/tmp"
 fi
 DEV_NAME=$(hdiutil attach -mountrandom ${MOUNT_RANDOM_PATH} -readwrite -noverify -noautoopen -nobrowse "${DMG_TEMP_NAME}" | grep -E --color=never '^/dev/' | sed 1q | awk '{print $1}')
-echo "Device name:     $DEV_NAME"
-MOUNT_DIR=$(find_mount_dir "${DEV_NAME}s")
+info "Device name:     $DEV_NAME"
+MOUNT_DIR=$(find_mount_dir "${DEV_NAME}")
 
 if [[ -z "${MOUNT_DIR}" ]]; then
-  >&2 echo "ERROR: unable to proceed with final disk image creation because the interstitial disk image was not found."
-  >&2 echo "The interstitial disk image will likely be mounted and will need to be cleaned up manually."
-  exit 1
+  die "Unable to proceed with final disk image creation because the interstitial disk image was not found.
+The interstitial disk image will likely be mounted and will need to be cleaned up manually.
+Expected device name: ${DEV_NAME}"
 fi
 
-echo "Mount dir:       $MOUNT_DIR"
+info "Mount dir:       $MOUNT_DIR"
+VOLUME_NAME=$(basename "$MOUNT_DIR")
 
 if [[ -n "$BACKGROUND_FILE" ]]; then
-	echo "Copying background file '$BACKGROUND_FILE'..."
-	[[ -d "$MOUNT_DIR/.background" ]] || mkdir "$MOUNT_DIR/.background"
-	cp "$BACKGROUND_FILE" "$MOUNT_DIR/.background/$BACKGROUND_FILE_NAME"
+  info "Copying background file '$BACKGROUND_FILE'..."
+  [[ -d "$MOUNT_DIR/.background" ]] || wet mkdir "$MOUNT_DIR/.background"
+  wet cp "$BACKGROUND_FILE" "$MOUNT_DIR/.background/$BACKGROUND_FILE_NAME"
 fi
 
 if [[ -n "$APPLICATION_LINK" ]]; then
-	echo "Making link to Applications dir..."
-	echo $MOUNT_DIR
-	ln -s /Applications "$MOUNT_DIR/Applications"
+  info "Making Applications drop target link..."
+  wet ln -s /Applications "$MOUNT_DIR/Applications"
 fi
 
 if [[ -n "$QL_LINK" ]]; then
-	echo "Making link to QuickLook install dir..."
-	echo $MOUNT_DIR
-	ln -s "/Library/QuickLook" "$MOUNT_DIR/QuickLook"
+  info "Making QuickLook install drop target link..."
+  wet ln -s "/Library/QuickLook" "$MOUNT_DIR/QuickLook"
 fi
 
 if [[ -n "$VOLUME_ICON_FILE" ]]; then
-	echo "Copying volume icon file '$VOLUME_ICON_FILE'..."
-	cp "$VOLUME_ICON_FILE" "$MOUNT_DIR/.VolumeIcon.icns"
-	SetFile -c icnC "$MOUNT_DIR/.VolumeIcon.icns"
+  info "Copying volume icon file '$VOLUME_ICON_FILE'..."
+  wet cp "$VOLUME_ICON_FILE" "$MOUNT_DIR/.VolumeIcon.icns"
+  wet SetFile -c icnC "$MOUNT_DIR/.VolumeIcon.icns"
 fi
 
 if [[ -n "$ADD_FILE_SOURCES" ]]; then
-	echo "Copying custom files..."
-	for i in "${!ADD_FILE_SOURCES[@]}"; do
-		echo "${ADD_FILE_SOURCES[$i]}"
-		cp -a "${ADD_FILE_SOURCES[$i]}" "$MOUNT_DIR/${ADD_FILE_TARGETS[$i]}"
-	done
+  info "Copying additional files..."
+  for i in "${!ADD_FILE_SOURCES[@]}"; do
+    info "Copying ${ADD_FILE_SOURCES[$i]}"
+    wet cp -a "${ADD_FILE_SOURCES[$i]}" "$MOUNT_DIR/${ADD_FILE_TARGETS[$i]}"
+  done
 fi
 
-VOLUME_NAME=$(basename $MOUNT_DIR)
-
+debug_section_header "Prettifying DMG"
 # Run AppleScript to do all the Finder cosmetic stuff
-APPLESCRIPT_FILE=$(mktemp -t createdmg.tmp.XXXXXXXXXX)
-if [[ $SANDBOX_SAFE -eq 1 ]]; then
-	echo "Skipping Finder-prettifying AppleScript because we are in Sandbox..."
+applescript_file=""
+if [[ $SANDBOX_SAFE == 1 ]]; then
+  info "Skipping prettification AppleScript because using Sandbox-compatible mode"
+elif [[ $SKIP_JENKINS == 1 ]]; then
+  info "Skipping prettification AppleScript because using --skip-jenkins"
 else
-	if [[ $SKIP_JENKINS -eq 0 ]]; then
-		cat "$CDMG_SUPPORT_DIR/template.applescript" \
-			| sed -e "s/WINX/$WINX/g" -e "s/WINY/$WINY/g" -e "s/WINW/$WINW/g" \
-					-e "s/WINH/$WINH/g" -e "s/BACKGROUND_CLAUSE/$BACKGROUND_CLAUSE/g" \
-					-e "s/REPOSITION_HIDDEN_FILES_CLAUSE/$REPOSITION_HIDDEN_FILES_CLAUSE/g" \
-					-e "s/ICON_SIZE/$ICON_SIZE/g" -e "s/TEXT_SIZE/$TEXT_SIZE/g" \
-			| perl -pe "s/POSITION_CLAUSE/$POSITION_CLAUSE/g" \
-			| perl -pe "s/QL_CLAUSE/$QL_CLAUSE/g" \
-			| perl -pe "s/APPLICATION_CLAUSE/$APPLICATION_CLAUSE/g" \
-			| perl -pe "s/HIDING_CLAUSE/$HIDING_CLAUSE/" \
-			> "$APPLESCRIPT_FILE"
-		sleep 2 # pause to workaround occasional "Can’t get disk" (-1728) issues  
-		echo "Running AppleScript to make Finder stuff pretty: /usr/bin/osascript \"${APPLESCRIPT_FILE}\" \"${VOLUME_NAME}\""
-		if /usr/bin/osascript "${APPLESCRIPT_FILE}" "${VOLUME_NAME}"; then
-			# Okay, we're cool
-			true
-		else
-			echo >&2 "Failed running AppleScript"
-			hdiutil_detach_retry "${DEV_NAME}"
-			exit 64
-		fi
-		echo "Done running the AppleScript..."
-		sleep 4
-		rm "$APPLESCRIPT_FILE"
+	info "Prettifying DMG..."
+	applescript_file=$(mktemp -t 'createdmg.tmp.XXXXXXXXXX')
+	cat "$CDMG_SUPPORT_DIR/template.applescript" \
+		| sed -e "s/WINX/$WINX/g" -e "s/WINY/$WINY/g" -e "s/WINW/$WINW/g" \
+				-e "s/WINH/$WINH/g" -e "s/BACKGROUND_CLAUSE/$BACKGROUND_CLAUSE/g" \
+				-e "s/REPOSITION_HIDDEN_FILES_CLAUSE/$REPOSITION_HIDDEN_FILES_CLAUSE/g" \
+				-e "s/ICON_SIZE/$ICON_SIZE/g" -e "s/TEXT_SIZE/$TEXT_SIZE/g" \
+		| perl -pe "s/POSITION_CLAUSE/$POSITION_CLAUSE/g" \
+		| perl -pe "s/QL_CLAUSE/$QL_CLAUSE/g" \
+		| perl -pe "s/APPLICATION_CLAUSE/$APPLICATION_CLAUSE/g" \
+		| perl -pe "s/HIDING_CLAUSE/$HIDING_CLAUSE/" \
+		> "$applescript_file"
+	sleep 8 # pause to work around occasional "Can’t get disk" (-1728) issues  
+	info "Running prettification AppleScript: /usr/bin/osascript \"${applescript_file}\" \"${VOLUME_NAME}\""
+	if /usr/bin/osascript "${applescript_file}" "${VOLUME_NAME}"; then
+		# Okay, we're cool
+		true
+	else
+		error "Failed running prettification AppleScript. Attempting to unmount before exiting..."
+		hdiutil_detach_retry "${DEV_NAME}"
+		error "DMG creation failed in prettification step"
+		exit 64
+	fi
+	info "Done running prettification AppleScript"
+	# Wait a bit to allow osascript to release file lock? Or maybe this sleep is copy-pasta
+	# from above and can be removed?
+	sleep 8
+	if [[ $DEBUG = 1 ]]; then
+	  echo "DEBUG: prettification AppleScript file was left at ${applescript_file}" 
+	else
+		rm "$applescript_file"
 	fi
 fi
 
-# Make sure it's not world writeable
-echo "Fixing permissions..."
+# Try to ensure it's not world writeable
+debug_section_header "Fixing File Permissions"
+info "Fixing file permissions..."
 chmod -Rf go-w "${MOUNT_DIR}" &> /dev/null || true
-echo "Done fixing permissions"
+info "Done fixing permissions"
 
-# Make the top window open itself on mount:
-if [[ $BLESS -eq 1 && $SANDBOX_SAFE -eq 0 ]]; then
-	echo "Blessing started"
-	if [ $(uname -m) == "arm64" ]; then
-		bless --folder "${MOUNT_DIR}"
-	else
-		bless --folder "${MOUNT_DIR}" --openfolder "${MOUNT_DIR}"
-	fi
-	echo "Blessing finished"
+# Make the top window open itself on mount
+if [[ $DO_BLESS == 1 && $SANDBOX_SAFE == 0 ]]; then
+  info "Blessing volume..."
+  if [[ "$MACHINE_ARCH" == "arm64" ]]; then
+	  # openfolder is not supported on Apple Silicon for some reason
+    bless --folder "${MOUNT_DIR}"
+  else
+    bless --folder "${MOUNT_DIR}" --openfolder "${MOUNT_DIR}"
+  fi
+  info "Finished blessing"
 else
-	echo "Skipping blessing on sandbox"
+  info "Skipped blessing"
 fi
 
 if [[ -n "$VOLUME_ICON_FILE" ]]; then
-	# Tell the volume that it has a special file attribute
-	SetFile -a C "$MOUNT_DIR"
+  # Tell the volume that it has a special file attribute
+  SetFile -a C "$MOUNT_DIR"
 fi
 
 # Delete unnecessary file system events log if possible
-echo "Deleting .fseventsd"
-rm -rf "${MOUNT_DIR}/.fseventsd" || true
+if [[ -d "${MOUNT_DIR}/.fseventsd" ]]; then
+  info "Deleting .fseventsd filesystem events log from DMG..."
+  rm -rf "${MOUNT_DIR}/.fseventsd" || true
+fi
 
+info "Unmounting..."
 hdiutil_detach_retry "${DEV_NAME}"
 
 # Compress image and optionally encrypt
-if [[ $ENABLE_ENCRYPTION -eq 0 ]]; then
-	echo "Compressing disk image..."
-	hdiutil convert ${HDIUTIL_VERBOSITY} "${DMG_TEMP_NAME}" -format ${FORMAT} ${IMAGEKEY} -o "${DMG_DIR}/${DMG_NAME}"
+debug_section_header "Compressing and Encrypting DMG"
+if [[ $ENABLE_ENCRYPTION == 0 ]]; then
+  info "Not encrypting disk image, because ENABLE_ENCRYPTION is off"
+  info "Compressing disk image..."
+  hdiutil convert ${HDIUTIL_VERB_ARGS} "${DMG_TEMP_NAME}" -format ${FORMAT} ${IMAGEKEY} \
+	  -o "${DMG_DIR}/${DMG_NAME}"
 else
-	echo "Compressing and encrypting disk image..."
-	echo "NOTE: hdiutil will only prompt a single time for a password - ensure entry is correct."
-	hdiutil convert ${HDIUTIL_VERBOSITY} "${DMG_TEMP_NAME}" -format ${FORMAT} ${IMAGEKEY} -encryption AES-${AESBITS} -stdinpass -o "${DMG_DIR}/${DMG_NAME}"
+  info "Compressing and encrypting disk image..."
+  info "NOTE: hdiutil will only prompt a single time for a password - ensure you enter it correctly."
+  hdiutil convert ${HDIUTIL_VERB_ARGS} "${DMG_TEMP_NAME}" -format ${FORMAT} ${IMAGEKEY} \
+	  -encryption AES-${AESBITS} -stdinpass -o "${DMG_DIR}/${DMG_NAME}"
 fi
+info "Deleting temporary DMG file..."
 rm -f "${DMG_TEMP_NAME}"
 
 # Adding EULA resources
 if [[ -n "${EULA_RSRC}" && "${EULA_RSRC}" != "-null-" ]]; then
-	echo "Adding EULA resources..."
-	#
-	# Use udifrez instead flatten/rez/unflatten
-	# https://github.com/create-dmg/create-dmg/issues/109
-	#
-	# Based on a thread from dawn2dusk & peterguy
-	# https://developer.apple.com/forums/thread/668084
-	#
-	EULA_RESOURCES_FILE=$(mktemp -t createdmg.tmp.XXXXXXXXXX)
-	EULA_FORMAT=$(file -b ${EULA_RSRC})
-	if [[ ${EULA_FORMAT} == 'Rich Text Format data'* ]] ; then
-		EULA_FORMAT='RTF '
-	else
-		EULA_FORMAT='TEXT'
-	fi
-	# Encode the EULA to base64
-	# Replace 'openssl base64' with 'base64' if Mac OS X 10.6 support is no more needed
-	# EULA_DATA="$(base64 -b 52 "${EULA_RSRC}" | sed s$'/^\(.*\)$/\t\t\t\\1/')"
-	EULA_DATA="$(openssl base64 -in "${EULA_RSRC}" | tr -d '\n' | awk '{gsub(/.{52}/,"&\n")}1' | sed s$'/^\(.*\)$/\t\t\t\\1/')"
-	# Fill the template with the custom EULA contents
-	eval "cat > \"${EULA_RESOURCES_FILE}\" <<EOF                                                                                                                  
-	$(<${CDMG_SUPPORT_DIR}/eula-resources-template.xml)
-	EOF
-	"
-	# Apply the resources
-	hdiutil udifrez -xml "${EULA_RESOURCES_FILE}" '' -quiet "${DMG_DIR}/${DMG_NAME}" || {
-		echo "Failed to add the EULA license"
-		exit 1
-	}
-	echo "Successfully added the EULA license"
+  info "Adding EULA resources..."
+  #
+  # Use udifrez instead flatten/rez/unflatten
+  # https://github.com/create-dmg/create-dmg/issues/109
+  #
+  # Based on a thread from dawn2dusk & peterguy
+  # https://developer.apple.com/forums/thread/668084
+  #
+  eula_resources_file=$(mktemp -t createdmg.tmp.XXXXXXXXXX)
+	# var names EULA_FORMAT and EULA_DATA must match names inside template file
+  EULA_FORMAT=$(file -b "${EULA_RSRC}")
+  if [[ ${EULA_FORMAT} == 'Rich Text Format data'* ]] ; then
+    EULA_FORMAT='RTF '
+  else
+    EULA_FORMAT='TEXT'
+  fi
+  # Encode the EULA to base64
+  # TODO: Replace 'openssl base64' with 'base64' when OS X 10.6 support is no longer needed
+  # EULA_DATA="$(base64 -b 52 "${EULA_RSRC}" | sed s$'/^\(.*\)$/\t\t\t\\1/')"
+  EULA_DATA="$(openssl base64 -in "${EULA_RSRC}" | tr -d '\n' | awk '{gsub(/.{52}/,"&\n")}1' | sed s$'/^\(.*\)$/\t\t\t\\1/')"
+  # Fill the template with the custom EULA contents
+	# TODO: This is buggy. Gives warning:
+	#   line 776: warning: here-document at line 669 delimited by end-of-file (wanted `EOF')
+  eval "cat > \"${eula_resources_file}\" <<EOF                                                                                                                  
+$(<${CDMG_SUPPORT_DIR}/eula-resources-template.xml)
+EOF
+  "
+  # Apply the resources
+  hdiutil udifrez -xml "${eula_resources_file}" '' -quiet "${DMG_DIR}/${DMG_NAME}" \
+	  || die "Failed to add the EULA license"
+  info "Added the EULA license"
 fi
 
 # Enable "internet", whatever that is
-if [[ ! -z "${NOINTERNET}" && "${NOINTERNET}" == 1 ]]; then
-	echo "Not setting 'internet-enable' on the dmg, per caller request"
+if [[ $NOINTERNET == 1 ]]; then
+  info "Skipping 'internet-enable' on the dmg because --no-internet was given"
 else
-	# Check if hdiutil supports internet-enable
-	# Support was removed in macOS 10.15. See https://github.com/andreyvit/create-dmg/issues/76
-	if hdiutil internet-enable -help >/dev/null 2>/dev/null; then
-		hdiutil internet-enable -yes "${DMG_DIR}/${DMG_NAME}"
-	else
-		echo "hdiutil does not support internet-enable. Note it was removed in macOS 10.15."
-	fi
+  # Check if hdiutil supports internet-enable
+  if hdiutil internet-enable -help &> /dev/null; then
+    hdiutil internet-enable -yes "${DMG_DIR}/${DMG_NAME}"
+  else
+    info "Skipping internet-enable because this hdiutil does not support it. (Was removed in macOS 10.15.)"
+  fi
 fi
 
 if [[ -n "${SIGNATURE}" && "${SIGNATURE}" != "-null-" ]]; then
-	echo "Codesign started"	
-	codesign -s "${SIGNATURE}" "${DMG_DIR}/${DMG_NAME}"
-	dmgsignaturecheck="$(codesign --verify --deep --verbose=2 --strict "${DMG_DIR}/${DMG_NAME}" 2>&1 >/dev/null)"
-	if [ $? -eq 0 ]; then
-		echo "The disk image is now codesigned"
-	else
-		echo "The signature seems invalid${NC}"
-		exit 1
-	fi
+  debug_section_header "Codesigning DMG"
+  info "Codesigning DMG..."
+  codesign -s "${SIGNATURE}" "${DMG_DIR}/${DMG_NAME}"
+  dmgsignaturecheck="$(codesign --verify --deep --verbose=2 --strict "${DMG_DIR}/${DMG_NAME}" &>/dev/null)"
+  if [[ $? == 0 ]]; then
+    info "Codesigning succeeded"
+  else
+	  # TODO: How does this $NC get set? Or is that a typo?
+    die "Codesigning failed. The signature seems invalid${NC}"
+  fi
 fi
 
 if [[ -n "${NOTARIZE}" && "${NOTARIZE}" != "-null-" ]]; then
-	echo "Notarization started"	
-	xcrun notarytool submit "${DMG_DIR}/${DMG_NAME}" --keychain-profile "${NOTARIZE}" --wait
-	echo "Stapling the notarization ticket"
-	staple="$(xcrun stapler staple "${DMG_DIR}/${DMG_NAME}")"
-	if [ $? -eq 0 ]; then
-		echo "The disk image is now notarized"
-	else
-		echo "$staple"
-		echo "The notarization failed with error $?"
-		exit 1
+  debug_section_header "Notarizing DMG"
+  info "Notarizating DMG..."
+  set +o errexit
+  xcrun notarytool submit "${DMG_DIR}/${DMG_NAME}" --keychain-profile "${NOTARIZE}" --wait
+  if [[ $? == 0 ]]; then
+	  die "Notarization submission failed"
 	fi
+  info "Stapling the notarization ticket"
+  staple_out=$(xcrun stapler staple "${DMG_DIR}/${DMG_NAME}")
+	staple_exit=$?
+  if [[ $? == 0 ]]; then
+    info "Notarizing succeeded"
+  else
+    die "Notarization failed. Exit status: $staple_exit"
+  fi
+  set -o errexit
 fi
 
 # All done!
-echo "Disk image done"
+info "Disk image created OK"
+if [[ $DEBUG = 1 ]]; then
+  if [[ -n "$applescript_file" ]]; then
+	  echo "DEBUG: prettification AppleScript file was left at ${applescript_file}"
+	fi
+fi
 exit 0

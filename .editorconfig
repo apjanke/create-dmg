@@ -9,7 +9,7 @@ insert_final_newline = true
 charset = utf-8
 
 # We use tabs in our own code
-[{create-dmg,*.applescript,*.sh}]
+[{create-dmg,*.applescript,*.sh,*.xml,*.applescript}]
 indent_style = tab
 indent_size = 2
 

@@ -1,4 +1,4 @@
-# Makefile for Cowsay
+# Makefile for create-dmg
 
 PACKAGE_TARNAME = create-dmg
 
