@@ -63,9 +63,9 @@ function is_dry_run() {
 
 function wet() {
   if is_dry_run; then
-    echo "dry run: would run: $*"
+    echo "dry run: would run: $@"
   else
-    verbose "running: $*"
+    verbose "running: $@"
     "$@"
   fi
 }
@@ -95,7 +95,7 @@ FILESYSTEM='HFS+'
 ADD_FILE_SOURCES=()
 ADD_FILE_TARGETS=()
 IMAGEKEY=''
-HDIUTIL_VERB_ARGS=''
+HDIUTIL_VERBOSE_ARGS=''
 SANDBOX_SAFE=0
 DO_BLESS=0
 NOINTERNET=0
@@ -105,10 +105,7 @@ SIGNATURE=''
 NOTARIZE=''
 QL_LINK=''
 ENABLE_ENCRYPTION=0
-# Default to verbose while debugging.
-# TODO: Remove when done debugging
-VERBOSE=1
-# VERBOSE=0
+VERBOSE=0
 DRY_RUN=0
 DEBUG=0
 
@@ -306,11 +303,11 @@ while [[ "${1:0:1}" = "-" ]]; do
     --disk-image-size)
       DISK_IMAGE_SIZE="$1"; shift ;;
     --hdiutil-verbose)
-      HDIUTIL_VERB_ARGS='-verbose' ;;
+      HDIUTIL_VERBOSE_ARGS='-verbose' ;;
 		--verbose)
 		  VERBOSE=1 ;;
     --hdiutil-quiet)
-      HDIUTIL_VERB_ARGS='-quiet' ;;
+      HDIUTIL_VERBOSE_ARGS='-quiet' ;;
     --bless)
       BLESS=1 ;;
     --codesign)
@@ -471,17 +468,18 @@ fi
 
 info "Creating interstitial DMG at: ${DMG_TEMP_NAME}"
 if [[ $SANDBOX_SAFE == 0 ]]; then
+  # non-sandbox variant
   if [[ $FILESYSTEM == "APFS" ]]; then
     FILESYSTEM_ARGS=""
   else
     FILESYSTEM_ARGS="-c c=64,a=16,e=16"
   fi
-  wet hdiutil create ${HDIUTIL_VERB_ARGS} -srcfolder "$SRC_FOLDER" -volname "$VOLUME_NAME" \
+  wet hdiutil create ${HDIUTIL_VERBOSE_ARGS} -srcfolder "$SRC_FOLDER" -volname "$VOLUME_NAME" \
     -fs "${FILESYSTEM}" -fsargs "${FILESYSTEM_ARGS}" -format UDRW ${CUSTOM_SIZE_ARGS} \
     "$DMG_TEMP_NAME"
 else
   # sandbox-safe variant
-  wet hdiutil makehybrid ${HDIUTIL_VERB_ARGS} -default-volume-name "$VOLUME_NAME" -hfs \
+  wet hdiutil makehybrid ${HDIUTIL_VERBOSE_ARGS} -default-volume-name "$VOLUME_NAME" -hfs \
     -o "$DMG_TEMP_NAME" "$SRC_FOLDER"
   wet hdiutil convert -format UDRW -ov -o "$DMG_TEMP_NAME" "$DMG_TEMP_NAME"
   DISK_IMAGE_SIZE_CUSTOM="$DISK_IMAGE_SIZE"
@@ -517,7 +515,7 @@ if [[ $min_disk_image_size > $DISK_IMAGE_SIZE ]]; then
 fi
 
 # Resize the image for the extra stuff
-wet hdiutil resize ${HDIUTIL_VERB_ARGS} -size "${DISK_IMAGE_SIZE}m" "${DMG_TEMP_NAME}"
+wet hdiutil resize ${HDIUTIL_VERBOSE_ARGS} -size "${DISK_IMAGE_SIZE}m" "${DMG_TEMP_NAME}"
 
 # Mount the new DMG
 
@@ -656,12 +654,12 @@ debug_section_header "Compressing and Encrypting DMG"
 if [[ $ENABLE_ENCRYPTION == 0 ]]; then
   info "Not encrypting disk image, because ENABLE_ENCRYPTION is off"
   info "Compressing disk image..."
-  hdiutil convert ${HDIUTIL_VERB_ARGS} "${DMG_TEMP_NAME}" -format ${FORMAT} ${IMAGEKEY} \
+  hdiutil convert ${HDIUTIL_VERBOSE_ARGS} "${DMG_TEMP_NAME}" -format ${FORMAT} ${IMAGEKEY} \
 	  -o "${DMG_DIR}/${DMG_NAME}"
 else
   info "Compressing and encrypting disk image..."
   info "NOTE: hdiutil will only prompt a single time for a password - ensure you enter it correctly."
-  hdiutil convert ${HDIUTIL_VERB_ARGS} "${DMG_TEMP_NAME}" -format ${FORMAT} ${IMAGEKEY} \
+  hdiutil convert ${HDIUTIL_VERBOSE_ARGS} "${DMG_TEMP_NAME}" -format ${FORMAT} ${IMAGEKEY} \
 	  -encryption AES-${AESBITS} -stdinpass -o "${DMG_DIR}/${DMG_NAME}"
 fi
 info "Deleting temporary DMG file..."

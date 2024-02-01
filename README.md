@@ -77,6 +77,8 @@ All contents of source\_folder will be copied into the disk image.
 - **--version** – show tool version number
 - **--help**, **-h** – display the help
 
+On newer versions of macOS (like macOS 12 or newer), you may need to run create-dmg with `sudo` for it to succeed. This may depend on the state of the files you're adding to the DMG, your system configuration, and other things. This can fix "permission denied" errors when adding files to the DMG.
+
 Encryption
 ----------
 
