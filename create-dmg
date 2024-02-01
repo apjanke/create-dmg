@@ -195,18 +195,19 @@ EOHELP
 # Factors can cause interstitial disk images to contain more than a single
 # partition - expand the hunt for the temporary disk image by checking for
 # the path of the volume, versus assuming it's the first result (as in pr/152).
-function find_mount_dir() {
-  local dev_name="${1}"
-	local found_dir
+function find_mountrandom_dir() {
+  local dev_path="${1}"
+	local found_dir hdi_info
 
-  info2 "Searching for mounted interstitial disk image for device ${dev_name}... "
+  info2 "Searching for mounted interstitial disk image for device ${dev_path}... "
+
   # enumerate up to 9 partitions
   for i in {1..9}; do
 		# The "s" suffix is to select /dev/diskMsN volumes instead of the main /dev/diskM
 		# block device.
-    found_dir=$(hdiutil info | grep -E --color=never "${dev_name}s" | head -${i} | tail -1 | awk '{print $3}')
+    found_dir=$(hdiutil info | grep -E --color=never "${dev_path}s" | head -${i} | tail -1 | awk '{print $3}')
     if [[ -n "${found_dir}" ]]; then
-		  info2 "find_mount_dir: found ${dev_name} at: ${found_dir}"
+		  info2 "find_mount_dir: found ${dev_path} at: ${found_dir}"
 			echo "${found_dir}"
 			return 0
     fi
@@ -522,7 +523,7 @@ wet hdiutil resize ${HDIUTIL_VERBOSE_ARGS} -size "${DISK_IMAGE_SIZE}m" "${DMG_TE
 info "Mounting disk image..."
 
 if is_dry_run; then
-  echo "dry run: This is as far as a dry run can proceed. Exiting."
+  info "dry run: This is as far as a dry run can proceed. Exiting."
 	exit 0
 fi
 
@@ -530,9 +531,22 @@ MOUNT_RANDOM_PATH="/Volumes"
 if [[ $SANDBOX_SAFE -eq 1 ]]; then
   MOUNT_RANDOM_PATH="/tmp"
 fi
-DEV_NAME=$(hdiutil attach -mountrandom ${MOUNT_RANDOM_PATH} -readwrite -noverify -noautoopen -nobrowse "${DMG_TEMP_NAME}" | grep -E --color=never '^/dev/' | sed 1q | awk '{print $1}')
-info "Device name:     $DEV_NAME"
-MOUNT_DIR=$(find_mount_dir "${DEV_NAME}")
+attach_out=$(hdiutil attach -mountrandom "${MOUNT_RANDOM_PATH}" -readwrite -noverify -noautoopen -nobrowse "${DMG_TEMP_NAME}")
+info "Attached interstitial DMG."
+if [[ $VERBOSE == 1 ]]; then
+  echo "hdiutil attach output:"
+	echo "${attach_out}"
+fi
+DEV_NAME=$(echo "$attach_out" | grep -E --color=never '^/dev/' \
+    | grep -E --color=never "${MOUNT_RANDOM_PATH}" \
+		| sed 1q | awk '{print $1}')
+info "Detected device path for main volume in mounted DMG: $DEV_NAME"
+# not working for DMG with APFS filesystem
+# MOUNT_DIR=$(find_mountrandom_dir "${DEV_NAME}")
+# workaround: pick first mounted volume
+MOUNT_DIR=$(echo "$attach_out" | grep -E --color=never '^/dev/' \
+    | grep -E --color=never "${MOUNT_RANDOM_PATH}" \
+		| sed 1q | awk '{print $3}')
 
 if [[ -z "${MOUNT_DIR}" ]]; then
   die "Unable to proceed with final disk image creation because the interstitial disk image was not found.
